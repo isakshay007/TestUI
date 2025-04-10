@@ -1,63 +1,23 @@
 import streamlit as st
-import os
 import joblib
-import torch
-import numpy as np
-import pickle
-from transformers import DistilBertTokenizer, DistilBertModel
+import os
+from hmm import HMM_Tagger
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from hmm import HMM_Tagger
-from torch import nn
-
-# ========== MODEL DEFINITIONS ==========
-
-class MiniTagTransformer(nn.Module):
-    def __init__(self, num_tags):
-        super().__init__()
-        self.bert = DistilBertModel.from_pretrained("distilbert-base-uncased")
-        self.classifier = nn.Linear(self.bert.config.hidden_size, num_tags)
-
-    def forward(self, input_ids, attention_mask):
-        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        cls_output = outputs.last_hidden_state[:, 0, :]
-        return self.classifier(cls_output)
-
-# ========== HELPERS ==========
-
-@st.cache_resource
-
-def load_models():
-    BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-    model_paths = {
-        "ml_model": os.path.join(BASE_DIR, "models", "tagging_model.pkl"),
-        "mlb_ml": os.path.join(BASE_DIR, "models", "tagging_mlb.pkl"),
-        "bert_model": os.path.join(BASE_DIR, "models", "trained_model.pt"),
-        "mlb_bert": os.path.join(BASE_DIR, "models", "mlb.pkl"),
-        "hmm_model": os.path.join(BASE_DIR, "models", "hmm_model.pkl")
-    }
-
-    ml_model = joblib.load(model_paths["ml_model"])
-    mlb_ml = joblib.load(model_paths["mlb_ml"])
-
-    with open(model_paths["mlb_bert"], "rb") as f:
-        mlb_bert = pickle.load(f)
-
-    bert_model = MiniTagTransformer(num_tags=len(mlb_bert.classes_))
-    bert_model.load_state_dict(torch.load(model_paths["bert_model"], map_location=torch.device("cpu")))
-    bert_model.eval()
-
-    hmm_model = HMM_Tagger()
-    hmm_model.load_model(model_paths["hmm_model"])
-
-    tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
-
-    return ml_model, mlb_ml, hmm_model, bert_model, mlb_bert, tokenizer
-
+import numpy as np
 
 def preprocess(text):
     return text.lower().strip()
 
+def load_models():
+    BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+    ml_model = joblib.load(os.path.join(BASE_DIR, "models", "tagging_model.pkl"))
+    mlb = joblib.load(os.path.join(BASE_DIR, "models", "tagging_mlb.pkl"))
+
+    hmm_model = HMM_Tagger()
+    hmm_model.load_model(os.path.join(BASE_DIR, "models", "hmm_model.pkl"))
+
+    return ml_model, mlb, hmm_model
 
 def predict_ml(model, mlb, title, description, threshold=0.08):
     combined_text = title + " " + description
@@ -67,17 +27,17 @@ def predict_ml(model, mlb, title, description, threshold=0.08):
     predicted_labels = [label for label, score in sorted_probs if score >= threshold]
     return predicted_labels, sorted_probs
 
-
 def predict_hmm(hmm_model, title, description, threshold=0.1):
     combined_text = title + " " + description
     predicted_tags = hmm_model.predict(combined_text)
 
     input_sentence = preprocess(description)
     predicted_tags = list(set([preprocess(tag) for tag in predicted_tags]))
-    all_text = [input_sentence] + predicted_tags
 
+    all_text = [input_sentence] + predicted_tags
     vectorizer = TfidfVectorizer()
     tfidf_matrix = vectorizer.fit_transform(all_text)
+
     cosine_similarities = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:]).flatten()
 
     filtered_tags = [(tag, score) for tag, score in zip(predicted_tags, cosine_similarities) if score >= threshold]
@@ -85,75 +45,54 @@ def predict_hmm(hmm_model, title, description, threshold=0.1):
     return sorted_tags
 
 
-def predict_bert(text, model, tokenizer, mlb, threshold=0.05, show_top_k=5, fallback=True):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    tokenizer_inputs = tokenizer(text, return_tensors="pt", truncation=True, padding="max_length", max_length=128)
-    tokenizer_inputs = {key: val.to(device) for key, val in tokenizer_inputs.items()}
-
-    with torch.no_grad():
-        logits = model(tokenizer_inputs["input_ids"], tokenizer_inputs["attention_mask"])
-        probs = torch.sigmoid(logits).squeeze().cpu().numpy()
-
-    top_probs = sorted(enumerate(probs), key=lambda x: x[1], reverse=True)[:show_top_k]
-    predicted_indices = np.where(probs >= threshold)[0]
-    tags = [mlb.classes_[i] for i in predicted_indices]
-
-    if fallback and not tags:
-        tags = [mlb.classes_[i] for i, _ in top_probs]
-
-    top_tags = [(mlb.classes_[i], p) for i, p in top_probs]
-    return tags, top_tags
-
-# ========== STREAMLIT UI ==========
-
+# Set UI layout
 st.set_page_config(page_title="StackOverflow Tag Generator", layout="wide")
-st.title("🚀 StackOverflow Tag Generator")
 
+# Title & Intro
+st.title("🚀 StackOverflow Tag Generator")
 st.markdown("""
-This tool generates relevant tags for your technical questions using:
-- Logistic Regression (TF-IDF)
-- Hidden Markov Model (HMM)
-- DistilBERT Transformer
+Welcome to the **StackOverflow AI Tagging System**!  
+This tool helps you generate relevant tags for your technical questions using either a **Logistic Regression-based ML model** or a **Hidden Markov Model (HMM)**.
+
+👇 Start by selecting the model you'd like to use.
 """)
 
-with st.spinner("🔄 Loading models..."):
-    ml_model, mlb_ml, hmm_model, bert_model, mlb_bert, tokenizer = load_models()
+# Load models
+with st.spinner("Loading models..."):
+    ml_model, mlb, hmm_model = load_models()
 
-model_choice = st.selectbox("📊 Select Model", ["Logistic Regression (ML)", "Hidden Markov Model (HMM)", "DistilBERT Transformer"])
+# Model Selection
+model_choice = st.selectbox("📊 Select Tag Prediction Model", ["Logistic Regression (ML)", "Hidden Markov Model (HMM)"])
+st.markdown("---")
 
-st.subheader("📝 Provide Question Details")
-title = st.text_input("📌 Question Title")
-description = st.text_area("🧠 Question Description", height=200)
+# Title + Description inputs
+st.subheader("📝 Provide your Question Details")
+title = st.text_input("📌 Question Title", placeholder="e.g., How to merge dictionaries in Python?")
+description = st.text_area("🧠 Question Description", placeholder="Provide details about your issue, approach, error, etc.", height=200)
 
+# Submit button
 if st.button("Generate Tags"):
     if not title.strip() or not description.strip():
-        st.warning("Please fill in both title and description")
+        st.warning("Please fill in both title and description.")
     else:
-        with st.spinner("⚙️ Generating tags..."):
+        with st.spinner("Generating tags..."):
             if model_choice == "Logistic Regression (ML)":
-                tags, scores = predict_ml(ml_model, mlb_ml, title, description)
-                st.subheader("🎯 Predicted Tags")
-                st.write(", ".join(tags) if tags else "No tags above threshold")
+                tags, scores = predict_ml(ml_model, mlb, title, description)
+                st.subheader("🎯 Predicted Tags:")
+                st.write(", ".join(tags) if tags else "No tags above threshold.")
 
-                st.subheader("📊 Top Probabilities")
+                st.subheader("📊 Tag Probabilities:")
                 for tag, score in scores[:10]:
                     st.write(f"**{tag}**: {score:.3f}")
-
-            elif model_choice == "Hidden Markov Model (HMM)":
-                hmm_results = predict_hmm(hmm_model, title, description)
-                st.subheader("🎯 Predicted Tags")
-                for tag, score in hmm_results[:10]:
-                    st.write(f"**{tag}**: {score:.3f}")
-
             else:
-                combined = title + " " + description
-                tags, scores = predict_bert(combined, bert_model, tokenizer, mlb_bert)
-                st.subheader("🎯 Predicted Tags")
-                st.write(", ".join(tags))
-                st.subheader("📊 Top Tag Probabilities")
-                for tag, prob in scores:
-                    st.write(f"**{tag}**: {prob:.3f}")
+                hmm_results = predict_hmm(hmm_model, title, description)
+                st.subheader("🎯 Predicted Tags:")
+                if hmm_results:
+                    for tag, score in hmm_results[:10]:
+                        st.write(f"**{tag}**: {score:.3f}")
+                else:
+                    st.write("No relevant tags found.")
 
+# Footer
 st.markdown("---")
-st.caption("Made with ❤️ using Streamlit | Powered by ML, HMM, and BERT")
+st.markdown("Made with ❤️ using Streamlit | Powered by Logistic Regression & HMM")
